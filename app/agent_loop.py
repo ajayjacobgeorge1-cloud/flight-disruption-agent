@@ -7,6 +7,7 @@ tool schemas, and available tool names differ per role.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -16,6 +17,35 @@ from app.llm_client import LLMClient, LLMResponse
 from app.tools import execute_tool
 
 ToolExecutor = Callable[[str, dict[str, Any]], dict[str, Any]]
+
+# The model this project targets (a small 7B instruct model) sometimes
+# narrates a hypothetical plan instead of actually issuing a tool call --
+# either leaving template placeholders like `[flight_number]` in what it
+# presents as its answer, or inlining a fake tool-call payload as plain
+# text (its own native `[TOOL_CALLS] [...]` syntax, or a bare
+# `[{"arguments": ...}, "tool_name"]`-shaped fragment) instead of using
+# the structured tool-calling API. None of that is ever a valid final
+# answer, so detect it and give the model one or two chances to
+# self-correct before accepting it (bounded by MAX_SELF_CORRECTION_NUDGES,
+# independent of max_iterations).
+_UNFULFILLED_PLAN_PATTERNS = [
+    re.compile(r"\[[a-zA-Z_][a-zA-Z0-9_]*\]"),  # e.g. "[flight_number]"
+    re.compile(r"\[\s*TOOL_CALLS\s*\]", re.IGNORECASE),
+    re.compile(r'"arguments"\s*:'),  # a tool-call JSON payload leaked as text
+]
+MAX_SELF_CORRECTION_NUDGES = 2
+NO_ACTION_NUDGE = (
+    "That was not a real action: you did not call a tool through the "
+    "function-calling API, and your answer contained either unresolved "
+    "placeholders or a tool call written out as text instead of concrete "
+    "data. Call the appropriate function now, using the actual "
+    "tool-calling mechanism, with real arguments -- do not narrate, "
+    "summarize, or write out a tool call as text."
+)
+
+
+def looks_like_unfulfilled_plan(text: Optional[str]) -> bool:
+    return bool(text) and any(p.search(text) for p in _UNFULFILLED_PLAN_PATTERNS)
 
 
 @dataclass
@@ -62,9 +92,26 @@ def run_agent_loop(
         {"role": "user", "content": user_message},
     ]
     tool_calls: list[ToolCallRecord] = []
+    nudges_used = 0
 
     for _ in range(max_iterations):
         response: LLMResponse = client.chat(messages, tools=tool_schemas)
+
+        # Zero tool calls executed yet is itself a reliable failure signal here,
+        # independent of what the text looks like: every subagent's one job is
+        # to look something up, so a "final" answer that never consulted a tool
+        # is -- at best -- unverified, and at worst confidently fabricated (no
+        # text pattern reliably distinguishes a real answer from a fabricated
+        # one, but "never called anything" is a fact we can check directly).
+        no_action_taken = bool(tool_schemas) and not tool_calls
+        if response.stop_reason != "tool_use" and (
+            looks_like_unfulfilled_plan(response.content) or no_action_taken
+        ):
+            if nudges_used < MAX_SELF_CORRECTION_NUDGES:
+                nudges_used += 1
+                messages.append({"role": "assistant", "content": response.content})
+                messages.append({"role": "user", "content": NO_ACTION_NUDGE})
+                continue
 
         if response.stop_reason == "tool_use":
             assistant_msg: dict[str, Any] = {"role": "assistant", "content": response.content or None}

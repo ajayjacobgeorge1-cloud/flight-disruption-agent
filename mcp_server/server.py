@@ -33,14 +33,9 @@ def _as_result(fn, **kwargs) -> dict:
 
 @mcp.tool(
     description=(
-        "Retrieve a passenger's RESERVATION RECORD by PNR: passenger name, fare class, "
-        "ticket status, and the booked itinerary segments (flight numbers, dates, "
-        "origin/destination) exactly as ticketed. Use this FIRST whenever a PNR is "
-        "mentioned, to find out what the passenger is actually booked on. "
-        "Do NOT use this to check whether a flight is currently delayed or cancelled -- "
-        "it returns the booking as ticketed, not real-time operational status. For live "
-        "status, call get_flight_status with the flight_number and departure_date found "
-        "here."
+        "Get the passenger's reservation for a PNR: name, fare class, ticket status, "
+        "and booked flight segments as ticketed. Not live flight status -- use "
+        "get_flight_status for that."
     )
 )
 def get_booking(pnr: str) -> dict:
@@ -50,13 +45,9 @@ def get_booking(pnr: str) -> dict:
 
 @mcp.tool(
     description=(
-        "Check the REAL-TIME OPERATIONAL STATUS of ONE specific, already-scheduled "
-        "flight (on_time / delayed / cancelled), its disruption reason, gate, and "
-        "estimated departure. Requires an exact flight_number and date -- normally the "
-        "ones returned by get_booking for the passenger's own flight. "
-        "Do NOT use this to find other flights the passenger could take instead -- it "
-        "only reports on the single flight number you pass in, it does not search a "
-        "schedule. For rebooking candidates, use search_alternatives instead."
+        "Get the real-time status (on_time/delayed/cancelled) of one specific "
+        "flight_number and date. Not for finding other flights -- use "
+        "search_alternatives for that."
     )
 )
 def get_flight_status(flight_number: str, date: str) -> dict:
@@ -66,12 +57,9 @@ def get_flight_status(flight_number: str, date: str) -> dict:
 
 @mcp.tool(
     description=(
-        "SEARCH for alternative, bookable flights between an origin and destination on "
-        "a given date -- used to find rebooking options after a disruption. Returns a "
-        "list of candidate flights with seat availability and fare difference versus the "
-        "original ticket. This does NOT check the operational status of any specific "
-        "flight (use get_flight_status for that) and it does NOT book anything (use "
-        "rebook_itinerary for that) -- it only lists candidates to choose from."
+        "Search bookable alternative flights between an origin and destination on a "
+        "date, with fares. Does not check a specific flight's status (use "
+        "get_flight_status) and does not book anything (use rebook_itinerary)."
     )
 )
 def search_alternatives(
@@ -90,12 +78,9 @@ def search_alternatives(
 
 @mcp.tool(
     description=(
-        "Look up the airline's IRROPS (irregular operations) policy on a topic -- one of "
-        "'rebooking', 'hotel', 'compensation', or 'escalation' -- and return the relevant "
-        "policy clause with a source citation. Use this to ground any statement about "
-        "what the passenger is entitled to; never state entitlements from memory. This "
-        "tool only reads policy text; it has no knowledge of this passenger's specific "
-        "booking or flight."
+        "Look up IRROPS policy text for a topic (rebooking/hotel/compensation/"
+        "escalation), with a citation. Ground any entitlement claim in this -- never "
+        "state one from memory. Has no booking or flight data."
     )
 )
 def read_policy(topic: str) -> dict:
@@ -105,12 +90,9 @@ def read_policy(topic: str) -> dict:
 
 @mcp.tool(
     description=(
-        "MUTATING ACTION: actually rebook the passenger's PNR onto a new flight_number "
-        "chosen from search_alternatives, at the given fare_difference_usd. This changes "
-        "the live reservation -- only call it once a specific alternative has been "
-        "selected and the fare difference is known. The calling agent/orchestrator is "
-        "expected to enforce its own approval threshold before calling this -- this tool "
-        "performs no business-rule check of its own."
+        "Rebook a PNR onto new_flight_number at fare_difference_usd. Mutates the live "
+        "reservation -- call only once a specific alternative and fare are known. The "
+        "caller must enforce its own approval threshold; this tool does not."
     )
 )
 def rebook_itinerary(pnr: str, new_flight_number: str, fare_difference_usd: float) -> dict:

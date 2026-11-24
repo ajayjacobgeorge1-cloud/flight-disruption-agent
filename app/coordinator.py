@@ -10,9 +10,14 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
-from app.agent_loop import ToolCallRecord
+from app.agent_loop import (
+    MAX_SELF_CORRECTION_NUDGES,
+    NO_ACTION_NUDGE,
+    ToolCallRecord,
+    looks_like_unfulfilled_plan,
+)
 from app.config import SETTINGS
 from app.hooks import pre_tool_use_hook
 from app.llm_client import LLMClient
@@ -83,6 +88,7 @@ def run_coordinator(
     subagent_client: Optional[LLMClient] = None,
     max_iterations: Optional[int] = None,
     system_prompt_override: Optional[str] = None,
+    on_token: Optional[Callable[[str], None]] = None,
 ) -> CoordinatorRunResult:
     client = client or LLMClient()
     subagent_client = subagent_client or client
@@ -95,9 +101,23 @@ def run_coordinator(
     ]
     subagent_calls: list[SubagentCallRecord] = []
     tool_calls: list[ToolCallRecord] = []
+    nudges_used = 0
 
     for _ in range(max_iterations):
-        response = client.chat(messages, tools=COORDINATOR_TOOLS)
+        response = client.chat(messages, tools=COORDINATOR_TOOLS, on_token=on_token)
+
+        # See app/agent_loop.py's matching check: "answered without ever
+        # dispatching a subagent or calling a tool" is a reliable failure
+        # signal on its own, independent of what the text looks like.
+        no_action_taken = not subagent_calls and not tool_calls
+        if response.stop_reason != "tool_use" and (
+            looks_like_unfulfilled_plan(response.content) or no_action_taken
+        ):
+            if nudges_used < MAX_SELF_CORRECTION_NUDGES:
+                nudges_used += 1
+                messages.append({"role": "assistant", "content": response.content})
+                messages.append({"role": "user", "content": NO_ACTION_NUDGE})
+                continue
 
         if response.stop_reason != "tool_use":
             messages.append({"role": "assistant", "content": response.content})

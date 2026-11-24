@@ -53,7 +53,7 @@ class LLMClient:
 
     def _http_transport(self, payload: dict[str, Any]) -> dict[str, Any]:
         headers = {
-            "Authorization": f"Bearer {SETTINGS.llm_api_key}",
+            "x-bf-vk": SETTINGS.llm_api_key,
             "Content-Type": "application/json",
         }
         resp = requests.post(
@@ -65,11 +65,73 @@ class LLMClient:
         resp.raise_for_status()
         return resp.json()
 
+    def _http_transport_stream(
+        self, payload: dict[str, Any], on_token: Callable[[str], None]
+    ) -> dict[str, Any]:
+        """Same endpoint, SSE (`stream: true`). Calls `on_token` with each
+        incremental content chunk as it arrives, and reassembles the deltas
+        into the same raw shape `_http_transport` would have returned, so
+        `_parse` stays the single source of truth for both paths."""
+        headers = {
+            "x-bf-vk": SETTINGS.llm_api_key,
+            "Content-Type": "application/json",
+        }
+        resp = requests.post(
+            SETTINGS.llm_api_base_url,
+            headers=headers,
+            json={**payload, "stream": True},
+            timeout=SETTINGS.request_timeout_s,
+            stream=True,
+        )
+        resp.raise_for_status()
+
+        content_parts: list[str] = []
+        tool_call_parts: dict[int, dict[str, str]] = {}
+        finish_reason = "stop"
+
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data: "):
+                continue
+            data = line[len("data: "):]
+            if data == "[DONE]":
+                break
+            chunk = json.loads(data)
+            choice = chunk["choices"][0]
+            if choice.get("finish_reason"):
+                finish_reason = choice["finish_reason"]
+            delta = choice.get("delta", {})
+            if delta.get("content"):
+                content_parts.append(delta["content"])
+                on_token(delta["content"])
+            for tc_delta in delta.get("tool_calls") or []:
+                idx = tc_delta.get("index", 0)
+                slot = tool_call_parts.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                if tc_delta.get("id"):
+                    slot["id"] = tc_delta["id"]
+                fn = tc_delta.get("function") or {}
+                if fn.get("name"):
+                    slot["name"] = fn["name"]
+                if fn.get("arguments"):
+                    slot["arguments"] += fn["arguments"]
+
+        message: dict[str, Any] = {"role": "assistant", "content": "".join(content_parts) or None}
+        if tool_call_parts:
+            message["tool_calls"] = [
+                {
+                    "id": slot["id"],
+                    "type": "function",
+                    "function": {"name": slot["name"], "arguments": slot["arguments"]},
+                }
+                for _, slot in sorted(tool_call_parts.items())
+            ]
+        return {"choices": [{"finish_reason": finish_reason, "message": message}]}
+
     def chat(
         self,
         messages: list[dict[str, Any]],
         tools: Optional[list[dict[str, Any]]] = None,
-        temperature: float = 0.2,
+        temperature: float = 0.0,
+        on_token: Optional[Callable[[str], None]] = None,
     ) -> LLMResponse:
         payload: dict[str, Any] = {
             "model": self.model,
@@ -80,7 +142,10 @@ class LLMClient:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
 
-        raw = self._transport(payload)
+        if on_token is not None and self._transport is self._http_transport:
+            raw = self._http_transport_stream(payload, on_token)
+        else:
+            raw = self._transport(payload)
         return self._parse(raw)
 
     @staticmethod
