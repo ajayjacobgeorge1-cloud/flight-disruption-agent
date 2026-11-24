@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sys
+import traceback
 
 from app.coordinator import run_coordinator
 from app.state import ESCALATION_TICKETS
@@ -19,7 +20,23 @@ def main() -> None:
     else:
         user_message = input("Customer message: ")
 
-    result = run_coordinator(user_message)
+    try:
+        result = run_coordinator(user_message)
+    except Exception as exc:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        if status_code in (403, 429):
+            print(
+                "\nWe're getting too many requests at the moment. Please "
+                "wait a little while and try again."
+            )
+        else:
+            print(
+                "\nSomething went wrong while processing your request (a "
+                "backend/network error). Please try again in a moment."
+            )
+        print("\n--- technical detail ---", file=sys.stderr)
+        traceback.print_exc()
+        sys.exit(1)
 
     print("\n=== Subagent dispatch trace ===")
     for call in result.subagent_calls:

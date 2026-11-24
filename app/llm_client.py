@@ -9,6 +9,8 @@ that vocabulary and gives every other module a single place to depend on.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -22,6 +24,24 @@ FINISH_REASON_TO_STOP_REASON = {
     "length": "max_tokens",
     "content_filter": "refusal",
 }
+
+# The platform gateway occasionally returns one of these for a healthy
+# backend (observed: a bare 403 that clears up on the very next request)
+# -- worth a couple of quick retries rather than failing the whole
+# coordinator/subagent run over a one-off gateway blip.
+_TRANSIENT_HTTP_STATUS = {403, 429, 502, 503, 504}
+_MAX_HTTP_RETRIES = 3
+_RETRY_BACKOFF_S = 2.0
+
+# The coordinator dispatches subagents concurrently (app/coordinator.py's
+# ThreadPoolExecutor) -- that's a logical/architectural parallelism, not a
+# promise that the gateway can take several simultaneous requests. Observed:
+# 3 subagents firing at once (each possibly retrying) reliably triggers a
+# sustained 403 that even several retries-with-backoff don't clear, whereas
+# a lone request right next to it succeeds immediately. So the actual HTTP
+# calls are serialized here, process-wide, independent of how many threads
+# are logically "in flight" above this module.
+_OUTBOUND_REQUEST_SEMAPHORE = threading.Semaphore(1)
 
 
 @dataclass
@@ -51,18 +71,29 @@ class LLMClient:
         self.model = model or SETTINGS.llm_model
         self._transport = transport or self._http_transport
 
+    @staticmethod
+    def _post_with_retries(headers: dict[str, str], payload: dict[str, Any], stream: bool) -> requests.Response:
+        with _OUTBOUND_REQUEST_SEMAPHORE:
+            for attempt in range(_MAX_HTTP_RETRIES + 1):
+                resp = requests.post(
+                    SETTINGS.llm_api_base_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=SETTINGS.request_timeout_s,
+                    stream=stream,
+                )
+                if resp.status_code not in _TRANSIENT_HTTP_STATUS or attempt == _MAX_HTTP_RETRIES:
+                    resp.raise_for_status()
+                    return resp
+                time.sleep(_RETRY_BACKOFF_S * (attempt + 1))
+        raise AssertionError("unreachable")  # loop always returns or raises
+
     def _http_transport(self, payload: dict[str, Any]) -> dict[str, Any]:
         headers = {
             "x-bf-vk": SETTINGS.llm_api_key,
             "Content-Type": "application/json",
         }
-        resp = requests.post(
-            SETTINGS.llm_api_base_url,
-            headers=headers,
-            json=payload,
-            timeout=SETTINGS.request_timeout_s,
-        )
-        resp.raise_for_status()
+        resp = self._post_with_retries(headers, payload, stream=False)
         return resp.json()
 
     def _http_transport_stream(
@@ -76,14 +107,7 @@ class LLMClient:
             "x-bf-vk": SETTINGS.llm_api_key,
             "Content-Type": "application/json",
         }
-        resp = requests.post(
-            SETTINGS.llm_api_base_url,
-            headers=headers,
-            json={**payload, "stream": True},
-            timeout=SETTINGS.request_timeout_s,
-            stream=True,
-        )
-        resp.raise_for_status()
+        resp = self._post_with_retries(headers, {**payload, "stream": True}, stream=True)
 
         content_parts: list[str] = []
         tool_call_parts: dict[int, dict[str, str]] = {}
